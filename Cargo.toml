@@ -1,0 +1,11 @@
+[package]
+name = "able-spi-friend"
+version = "0.1.0"
+authors = ["Amer Safdari <amersafdari@gmail.com>"]
+edition = "2018"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
