@@ -11,7 +11,12 @@ bench = false
 [dependencies]
 nb = "1.0.0"
 embedded-hal = "0.2.4"
+ufmt-write = "0.1.0"
 
 [dependencies.arraydeque]
 version = "0.4.5"
 default-features = false
+
+[dependencies.feather_m0]
+version = "0.7.0"
+features = ["unproven"]
