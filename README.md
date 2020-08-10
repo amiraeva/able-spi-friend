@@ -1,7 +1,7 @@
 # able-spi-friend
 Rust library for the Adafruit BLE SPI Friend [WIP]
 
-Very rough around the edges (i.e. everything is hardcoded cause I'm an amateur). So far only works with the Adafruit Feather M0 BLE board, only using the Nordic UART service, with some odd timing bugs that halt my RTIC project. Use at your own risk.
+Very rough around the edges (i.e. everything is hardcoded cause I'm an amateur). So far only works with the Adafruit Feather M0 BLE board, only using the Nordic UART service, with some odd timing bugs that _occasionally_ halt my RTIC project on startup or when receiving a massive bolus of packets. Use at your own risk.
 
 Ideally the code would be cleaned up and depend on `embedded_hal` traits for the CS/IRQ pins, and the SPI bus, and export an implementation of some UART trait.
 
