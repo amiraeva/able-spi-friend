@@ -1,18 +1,16 @@
 #![no_std]
 
 use feather_m0::{
-    clock::{GenericClockController, Tc4Tc5Clock},
+    clock::GenericClockController,
     gpio::{Floating, Input, OpenDrain, Output, Pa12, Pa21, Pa6 as D8, Pb10, Pb11, PfD, Port},
-    pac::{PM, SERCOM4, TC5},
+    pac::{PM, SERCOM4},
     prelude::*,
     sercom::{SPIMaster4, Sercom4Pad0, Sercom4Pad2, Sercom4Pad3},
-    time::Microseconds,
-    timer::TimerCounter5,
 };
 
 use arraydeque::{ArrayDeque, Wrapping};
-use core::{cmp::min, iter};
-use nb::block;
+use core::{cmp::min, iter, marker::PhantomData};
+use embedded_hal::blocking::delay::DelayUs;
 
 type Sck = Pb11<Input<Floating>>;
 type Mosi = Pb10<Input<Floating>>;
@@ -21,25 +19,26 @@ type Irq = Pa21<Input<Floating>>;
 
 type Spi = SPIMaster4<Sercom4Pad0<Pa12<PfD>>, Sercom4Pad2<Pb10<PfD>>, Sercom4Pad3<Pb11<PfD>>>;
 
-pub struct BleUart {
+pub struct BleUart<T: From<u8>, D: DelayUs<T>> {
     spi: Spi,
     cs: ChipSelect,
-    tc5: TimerCounter5,
+    delay: D,
     irq: Irq,
     deque: ArrayDeque<[u8; 128], Wrapping>,
+    _marker: PhantomData<T>,
 }
 
-impl BleUart {
+impl<T: From<u8>, D: DelayUs<T>> BleUart<T, D> {
     const BUS_SPEED: u32 = 4_000_000;
-    const SPI_CS_DELAY: Microseconds = Microseconds(50);
-    const BLE_MAX_TIMEOUTS: usize = 10; // this * CS_DELAY = total timeout
+    const SPI_FRIEND_DELAY: u8 = 50;
+    const BLE_MAX_TIMEOUTS: usize = 10; // this * FRIEND_DELAY = total timeout
 
     const SPI_IGNORED_BYTE: u8 = 0xFE;
     const SPI_OVERREAD_BYTE: u8 = 0xFF;
     const SPI_RESPONSE_BYTE: u8 = 0x20;
     const SPI_ERROR_BYTE: u8 = 0x80;
 
-    const COMMAND_ID: u8 = 0x10;
+    const SPI_COMMAND_BYTE: u8 = 0x10;
 
     const SDEP_MAX_PACKET_SIZE: usize = 16;
     const SDEP_UARTRX_CMD: u16 = 0x0A02;
@@ -51,14 +50,12 @@ impl BleUart {
         sercom4: SERCOM4,
         d8: D8<Input<Floating>>,
         irq: Irq,
-        tc5: TC5,
-        tc45: &Tc4Tc5Clock,
+        delay: D,
         clocks: &mut GenericClockController,
         pm: &mut PM,
         port: &mut Port,
     ) -> Self {
         let cs = ChipSelect::new(d8, port);
-        let tc5 = TimerCounter5::tc5_(tc45, tc5, pm);
 
         let spi = feather_m0::spi_master(
             clocks,
@@ -76,9 +73,10 @@ impl BleUart {
         let mut ble = Self {
             spi,
             cs,
-            tc5,
+            delay,
             irq,
             deque,
+            _marker: PhantomData,
         };
 
         ble.send_init_pattern();
@@ -169,8 +167,7 @@ impl BleUart {
                     return;
                 }
                 // self.send_packet(Self::SDEP_UARTRX_CMD, &[], false);
-                self.tc5.start(Microseconds(50));
-                let _ = block!(self.tc5.wait());
+                self.delay.delay_us(T::from(Self::SPI_FRIEND_DELAY));
             }
         }
     }
@@ -186,14 +183,15 @@ impl BleUart {
         self.cs.enable();
 
         let spi = &mut self.spi;
-        let tc5 = &mut self.tc5;
         let cs = &mut self.cs;
+        let delay = &mut self.delay;
 
         let mut spi_xfer = || spi_transfer(spi, DUMMY_CMD);
+        let msg_handler = |msg| Self::handle_initial_msgs(msg, cs, delay);
 
         let _ = iter::repeat_with(&mut spi_xfer)
             .take(Self::BLE_MAX_TIMEOUTS)
-            .find_map(|msg| handle_initial_msgs(msg, cs, tc5))?;
+            .find_map(msg_handler)?;
 
         let cmd_id = u16::from_le_bytes([spi_xfer(), spi_xfer()]);
 
@@ -224,33 +222,65 @@ impl BleUart {
     }
 
     fn irq_ready(&mut self) -> bool {
-        const SPI_IRQ_DELAY: Microseconds = Microseconds(500);
+        // const SPI_IRQ_DELAY: Microseconds = Microseconds(500);
 
-        self.tc5.start(SPI_IRQ_DELAY);
+        // self.tc5.start(SPI_IRQ_DELAY);
 
-        while self.irq.is_high().unwrap() {
-            if self.tc5.wait().is_ok() {
-                return false;
+        // while self.irq.is_high().unwrap() {
+        //     if self.tc5.wait().is_ok() {
+        //         return false;
+        //     }
+        // }
+
+        // let irq = &mut self.irq;
+        // let delay = &mut self.delay;
+
+        let irq_rdy = || {
+            if !self.irq.is_high().unwrap() {
+                true
+            } else {
+                self.delay.delay_us(T::from(Self::SPI_FRIEND_DELAY));
+                false
             }
-        }
+        };
+
+        let rdy = iter::repeat_with(irq_rdy)
+            .take(Self::BLE_MAX_TIMEOUTS)
+            .any(|rdy| rdy == true);
 
         true
     }
 
     fn is_ready(&mut self) -> bool {
-        let byte = spi_transfer(&mut self.spi, Self::COMMAND_ID);
+        let byte = spi_transfer(&mut self.spi, Self::SPI_COMMAND_BYTE);
 
         if byte != Self::SPI_IGNORED_BYTE {
-            return true;
+            true
+        } else {
+            Self::cycle_cs(&mut self.cs, &mut self.delay);
+            false
         }
-
-        cycle_cs(&mut self.cs, &mut self.tc5);
-
-        false
     }
 
     fn deque_remaining(&self) -> usize {
         self.deque.capacity() - self.deque.len()
+    }
+
+    fn cycle_cs(cs: &mut ChipSelect, delay: &mut D) {
+        cs.disable();
+        delay.delay_us(T::from(Self::SPI_FRIEND_DELAY));
+        cs.enable();
+    }
+
+    fn handle_initial_msgs(msg: u8, cs: &mut ChipSelect, delay: &mut D) -> Option<u8> {
+        match msg {
+            Self::SPI_RESPONSE_BYTE => Some(msg),
+            Self::SPI_IGNORED_BYTE | Self::SPI_OVERREAD_BYTE => {
+                Self::cycle_cs(cs, delay);
+                None
+            }
+            Self::SPI_ERROR_BYTE | _ => None,
+        }
     }
 }
 
@@ -277,7 +307,7 @@ impl ChipSelect {
     }
 }
 
-impl ufmt_write::uWrite for BleUart {
+impl<T: From<u8>, D: DelayUs<T>> ufmt_write::uWrite for BleUart<T, D> {
     type Error = core::convert::Infallible;
 
     fn write_str(&mut self, s: &str) -> Result<(), Self::Error> {
@@ -287,27 +317,18 @@ impl ufmt_write::uWrite for BleUart {
 }
 
 fn spi_transfer(spi: &mut Spi, send: u8) -> u8 {
-    block!(spi.send(send)).unwrap();
-    let recv = block!(spi.read()).unwrap();
+    nb::block!(spi.send(send)).unwrap();
+    let recv = nb::block!(spi.read()).unwrap();
     recv
 }
 
-fn cycle_cs(cs: &mut ChipSelect, tc5: &mut TimerCounter5) {
-    cs.disable();
-
-    tc5.start(BleUart::SPI_CS_DELAY);
-    let _ = block!(tc5.wait());
-
-    cs.enable();
-}
-
-fn handle_initial_msgs(msg: u8, cs: &mut ChipSelect, tc5: &mut TimerCounter5) -> Option<u8> {
-    match msg {
-        BleUart::SPI_RESPONSE_BYTE => Some(msg),
-        BleUart::SPI_IGNORED_BYTE | BleUart::SPI_OVERREAD_BYTE => {
-            cycle_cs(cs, tc5);
-            None
-        },
-        BleUart::SPI_ERROR_BYTE | _ => None
-    }
-}
+// fn handle_initial_msgs(msg: u8, cs: &mut ChipSelect, tc5: &mut TimerCounter5) -> Option<u8> {
+//     match msg {
+//         BleUart::SPI_RESPONSE_BYTE => Some(msg),
+//         BleUart::SPI_IGNORED_BYTE | BleUart::SPI_OVERREAD_BYTE => {
+//             cycle_cs(cs, tc5);
+//             None
+//         },
+//         BleUart::SPI_ERROR_BYTE | _ => None
+//     }
+// }
