@@ -9,7 +9,7 @@ use feather_m0::{
 };
 
 use arraydeque::{ArrayDeque, Wrapping};
-use core::{cmp::min, iter, marker::PhantomData};
+use core::{cmp::min, convert::identity, iter, marker::PhantomData};
 use embedded_hal::blocking::delay::DelayUs;
 
 type Sck = Pb11<Input<Floating>>;
@@ -30,8 +30,8 @@ pub struct BleUart<T: From<u8>, D: DelayUs<T>> {
 
 impl<T: From<u8>, D: DelayUs<T>> BleUart<T, D> {
     const BUS_SPEED: u32 = 4_000_000;
-    const SPI_FRIEND_DELAY: u8 = 50;
-    const BLE_MAX_TIMEOUTS: usize = 10; // this * FRIEND_DELAY = total timeout
+    const SPI_FRIEND_DELAY: u8 = 100;
+    const BLE_MAX_TIMEOUTS: usize = 5; // this * FRIEND_DELAY = total timeout
 
     const SPI_IGNORED_BYTE: u8 = 0xFE;
     const SPI_OVERREAD_BYTE: u8 = 0xFF;
@@ -137,6 +137,7 @@ impl<T: From<u8>, D: DelayUs<T>> BleUart<T, D> {
 
         let rdy = iter::repeat_with(|| self.is_ready())
             .take(Self::BLE_MAX_TIMEOUTS)
+            .filter_map(identity)
             .any(|rdy| rdy == true);
 
         if !rdy {
@@ -154,7 +155,27 @@ impl<T: From<u8>, D: DelayUs<T>> BleUart<T, D> {
         let length = buf_len as u8 | md_bit;
         spi_transfer(&mut self.spi, length);
 
-        let _ = self.spi.write(&buf[..buf_len]);
+        let mut spi_xfer = |byte| spi_transfer(&mut self.spi, byte);
+
+        let retry_transfer = |byte| {
+            iter::repeat(byte)
+                .take(Self::BLE_MAX_TIMEOUTS)
+                .find_map(&mut spi_xfer)
+        };
+
+        let _num_bytes_transferred = buf
+            .iter()
+            .copied()
+            .take(buf_len)
+            .map(retry_transfer)
+            .take_while(Option::is_some)
+            .count();
+
+        // for &byte in buf[..buf_len].into_iter() {
+        //     spi_xfer(byte);
+        // }
+
+        // let _ = self.spi.write(&buf[..buf_len]);
 
         self.cs.disable();
         self.spi.disable();
@@ -167,7 +188,7 @@ impl<T: From<u8>, D: DelayUs<T>> BleUart<T, D> {
                     return;
                 }
                 // self.send_packet(Self::SDEP_UARTRX_CMD, &[], false);
-                self.delay.delay_us(T::from(Self::SPI_FRIEND_DELAY));
+                // self.delay.delay_us(T::from(Self::SPI_FRIEND_DELAY));
             }
         }
     }
@@ -191,15 +212,16 @@ impl<T: From<u8>, D: DelayUs<T>> BleUart<T, D> {
 
         let _ = iter::repeat_with(&mut spi_xfer)
             .take(Self::BLE_MAX_TIMEOUTS)
+            .filter_map(identity)
             .find_map(msg_handler)?;
 
-        let cmd_id = u16::from_le_bytes([spi_xfer(), spi_xfer()]);
+        let cmd_id = u16::from_le_bytes([spi_xfer()?, spi_xfer()?]);
 
         if cmd_id != Self::SDEP_UARTRX_CMD {
             return None;
         };
 
-        let len_tmp = spi_xfer();
+        let len_tmp = spi_xfer()?;
 
         let more_data = (len_tmp >> 7) != 0;
         let payload_len = (len_tmp & 0x1F) as usize;
@@ -211,9 +233,11 @@ impl<T: From<u8>, D: DelayUs<T>> BleUart<T, D> {
         let mut scratch = [0xFF; Self::SDEP_MAX_PACKET_SIZE];
         let buf = &mut scratch[..payload_len];
 
-        let data = self.spi.transfer(buf).ok()?;
+        let mut spi_xfer = |byte| spi_transfer(spi, byte);
+        let data = buf.iter().copied().filter_map(spi_xfer);
+        // let data = self.spi.transfer(buf).ok()?;
 
-        self.deque.extend_back(data.iter().copied());
+        self.deque.extend_back(data);
 
         self.cs.disable();
         self.spi.disable();
@@ -239,26 +263,27 @@ impl<T: From<u8>, D: DelayUs<T>> BleUart<T, D> {
             if !self.irq.is_high().unwrap() {
                 true
             } else {
-                self.delay.delay_us(T::from(Self::SPI_FRIEND_DELAY));
+                // self.delay.delay_us(T::from(Self::SPI_FRIEND_DELAY));
                 false
             }
         };
 
         let rdy = iter::repeat_with(irq_rdy)
-            .take(Self::BLE_MAX_TIMEOUTS)
+            // .take(Self::BLE_MAX_TIMEOUTS)
+            .take(1)
             .any(|rdy| rdy == true);
 
-        true
+        rdy
     }
 
-    fn is_ready(&mut self) -> bool {
-        let byte = spi_transfer(&mut self.spi, Self::SPI_COMMAND_BYTE);
+    fn is_ready(&mut self) -> Option<bool> {
+        let byte = spi_transfer(&mut self.spi, Self::SPI_COMMAND_BYTE)?;
 
         if byte != Self::SPI_IGNORED_BYTE {
-            true
+            Some(true)
         } else {
             Self::cycle_cs(&mut self.cs, &mut self.delay);
-            false
+            Some(false)
         }
     }
 
@@ -316,19 +341,15 @@ impl<T: From<u8>, D: DelayUs<T>> ufmt_write::uWrite for BleUart<T, D> {
     }
 }
 
-fn spi_transfer(spi: &mut Spi, send: u8) -> u8 {
-    nb::block!(spi.send(send)).unwrap();
-    let recv = nb::block!(spi.read()).unwrap();
+fn spi_transfer(spi: &mut Spi, send: u8) -> Option<u8> {
+    let try_send = || spi.send(send).ok();
+    try_x_times(try_send, 1)?;
+
+    let try_read = || spi.read().ok();
+    let recv = try_x_times(try_read, 100);
     recv
 }
 
-// fn handle_initial_msgs(msg: u8, cs: &mut ChipSelect, tc5: &mut TimerCounter5) -> Option<u8> {
-//     match msg {
-//         BleUart::SPI_RESPONSE_BYTE => Some(msg),
-//         BleUart::SPI_IGNORED_BYTE | BleUart::SPI_OVERREAD_BYTE => {
-//             cycle_cs(cs, tc5);
-//             None
-//         },
-//         BleUart::SPI_ERROR_BYTE | _ => None
-//     }
-// }
+fn try_x_times<T, F: FnMut() -> Option<T>>(f: F, x: usize) -> Option<T> {
+    iter::repeat_with(f).take(x).find_map(identity)
+}
